@@ -3,6 +3,119 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.64] - 2026-10-10
+
+### 修复
+
+- **`get_instrument` 在终端合约库被污染的机器上对齐 miniQMT 的正确值**（#405 的条件性缓解，
+  @yucejade 报告并贡献 PR #407）。终端侧 `ContextInfo.get_instrumentdetail` 的合约库在个别机器上
+  被污染且重启不自愈（`OpenDate` 返回 0 或借壳/更名日），而同机常驻登录的 miniQMT 行情服务对同批
+  代码全部正确。`get_instrument` 改走既有 `_native_or_context` 模式：native SDK 优先、ContextInfo
+  回落、#160 死标记窗口吸收拨号成本，开关沿用 `native_xtdata_enabled`（redis 传输默认开）。
+  **局限（重要）**：只有同机常驻登录 miniQMT 的部署才受益；没有 miniQMT 的部署行为不变（native
+  拨号失败即回落，每 600 秒窗口付一次拨号成本）。#405 的根治（终端合约库为何被污染、如何刷新）
+  仍开着。
+
+## [0.3.63] - 2026-10-10
+
+### 修复
+
+- **ZMQ 推送通道订阅者泄漏（重订阅阶梯式重复推送）**（#403，@simonfantasy 报告并给出根因与修法）。
+  `ZmqQuotePushChannel._sub_loop` 此前 keyed 在共享实例属性 `_running` 上：`stop()` 置 False，
+  下一次 `start_subscriber()` 置回 True——join 超时（线程卡在 on_msg 回调里）的旧线程看到 True
+  又复活，且挂着它创建时的旧 topic 集合。客户端每次 topic 集合变化都 stop+start，订阅 N 批就
+  留下最多 N-1 个僵尸订阅者，靠前的批被每个僵尸各收一份（实测 1.7×–7× 阶梯复制）。Redis 通道
+  早已是"每个订阅者私有 Event"，ZMQ 这路没跟上。现在对齐：订阅者捕获自己的 Event，join 超时
+  不再泄漏（Event 已置位，回调返回即退出并自闭 socket）；`start_subscriber` 自洽地先停旧的；
+  新增 `active_subscribers()` 诊断（健康值 0 或 1）。
+
+## [0.3.62] - 2026-10-09
+
+### 升级注意
+
+- 本次含**策略文件**（`bigqmt_signal_trader_strategy.py`：#389 合成事件的发布钩子装配）与
+  **runtime 顶层模块**（`bigqmt_signal_trader_redis_rpc_runtime.py`：#396 配置链）改动，
+  两者都不在 `reload_deployment` 的 purge 范围内——**策略重启一次才能全部生效**；
+  `sync + reload` 只激活包内改动。lemo 实盘已在重启后的 zmq 部署上验证全部生效。
+- #389 的 cancel_error 推送覆盖同步撤单路径；批量撤单（cancel_orders_batch）本就跳过结算、
+  靠原生状态推送确认，不在本次范围。
+
+### 修复
+
+- **pipeline 发布失败的异常消息不再内嵌完整响应载荷**（#398，@yucejade 报告并贡献 PR #399）。
+  redis-py 对失败的 pipeline 批量命令把完整命令参数（=响应 JSON 本身）渲染进异常消息：redis
+  maxmemory 触顶时单行日志实测 20MB、单文件累计 542MB，桥进程 IO 持续劣化直至停止消费请求队列。
+  新增 `_slim_pipeline_error`：消息超 500 字符时保留异常类型与错误头（如 "OOM command not
+  allowed"）、尾部替换为省略标记；短消息原样透传。
+
+- **撤单失败现在会推送 `on_cancel_error`**（#389，@tokens-lin 报告）。已成交的委托再撤，QMT 只在
+  自己日志里记"当前委托状态[已成]不可撤"，**对策略没有任何回调**——此前桥也不推，策略只能对着
+  死单反复撤。客户端订阅与 `on_cancel_error` 分发、事件 normalize/发布通道本来就是通的，缺的
+  是服务端调用点：撤单结算路径（#148 的读回确认）是唯一能结论"撤单没成"的地方，五类失败结局
+  （终态不可撤/超时未找到/查询失败等）现在统一经 `_fail_cancel_settlement` 合成 cancel_error
+  事件，由策略装配的钩子走与原生事件相同的通道与兜底发布。
+
+- **`get_history_trade_detail_data` 保住分组并如实报错**（#395，@shengyy 报告并附离线复现）。
+  ① 官方返回 `[(timetag, [deal, ...]), ...]` 分组形态，此前被 `_normalize_detail_rows` 当平铺
+  行处理，返回 `[{}]`——分组和成交记录全丢；现在分组序列化为 `{timetag, details[]}`（平铺形态
+  仍兼容）。② 函数未绑定/原生抛错/真空历史三者此前都返回 `ok=True, data=[]`，调用方无法区分
+  "没有成交"与"没有函数"；现在未绑定明确报错、原生异常传播、只有真空才返回空。
+
+- **`order_settle_timeout_seconds` 配置真正生效**（#396 附带发现，@TsqGit 报告）。此前
+  `configure_runtime_redis` 不读该键、`_apply_config` 不透传，strategy 侧永远拿默认 3.0——
+  用户在 local_config 里配了不生效。链路照 `drain_budget_seconds` 模式补齐（None 默认不透传，
+  显式配置才进 rpc block）。
+
+## [0.3.61] - 2026-10-01
+
+### 升级注意
+
+- 本次含**策略文件**（`bigqmt_signal_trader_strategy.py`）改动：#393 的 reload 身份 journal 移交
+  只有策略重启后才生效——`reload_deployment` 刷不了策略入口文件本身。常规 `sync + reload` 会让
+  除该移交外的全部修复立即生效；建议安排一次策略重启拿全。
+- #386 的分段慢日志（`slow response ... to_jsonable=... publish=...`）只在总时长超
+  `slow_request_seconds` 且 handler 段未超时时出现；看到它说明瓶颈在回复转换/发送，
+  应用侧用 `chunk_size` 分批或收窄窗口即可。
+
+### 修复
+
+- **自愈补数不再被空表骗过**（#387，@shengyy 报告并附离线复现）。服务端 `_raw_market_data_payload`
+  会为每个被请求的代码补空 envelope，原生读取失败的代码（如分钟订阅超限 ErrorID 210000）返回的是
+  空 DataFrame 而不是缺失键；客户端 `_served_codes` 此前按字典键计数，空表也算"已服务"，
+  `_heal_adjusted` 算出 missing=0，原始下载+重读从不触发——实盘 17 只里 14 只分钟线持续缺失而
+  自愈沉默。现在按真实行数计数；占位帧（#339，有行、量为 0）仍算已服务，多数缺失阈值规则不变，
+  少数停牌股不会变成每次调用都下载。
+
+- **`get_instrument_detail` 撤出 FormulaServer 直连**（#392，@sumo225270 报告并附 300 只双通道
+  对照）。国金 build 上 FormulaServer 的 `getInstrumentDetail` 对日频参考字段回答不可信：
+  `TotalVolume` 43% 返回 0、`OpenDate` 32% 返回 0、22% 非零但陈旧（最大偏差 87.7%），而走桥的
+  `ContextInfo.get_instrument_detail` 300/300 全对。结构完整但值错误的答案比没有答案更糟，
+  适配层无法区分陈旧与正确，三个 `get_instrument*` 方法移出 METHOD_MAP，一律回落 RPC。
+  代价是全市场逐只约 57–60ms；合约元数据属一次性读取，调用方通常有缓存。报告附带的
+  `subscribe=False` 透传诉求在 #361 已实现，无需再改。
+
+- **订单身份不再"突然"变成 QMT 进程名**（#393，@kingtsi 报告）。三条桥侧路径都会造成跳名：
+  （1）两处身份存储（redis + 进程内 journal）此前无条件覆盖——同 remark 复用时，后一笔带空
+  `strategy_name` 的提交会抹掉已记名字，行回落到 `m_strSource`（QMT 侧注册名）；（2）同 remark
+  换策略名提交会 retroactive 改掉已报告行的名字；（3）TTL 只有 24h，次日重读全部翻名；reload
+  会重建 handlers 清空进程内 journal，无 redis 部署瞬间全翻。现在两处存储都是"首个命名记录优先"
+  （空名提交永不覆盖，未命名记录让位给后来的命名提交，冲突改名记警告并忽略），TTL 延长到 7 天，
+  `_perform_reload` 会把 journal 移交新 handlers（该移交在策略文件里，需重启一次后生效）。
+
+- **慢请求日志覆盖回复转换与发送段**（#386，@shengyy 报告并附 `_t_recv`/`_t_reply` 证据）。
+  此前 `_note_slow_request` 只计 `handlers.handle` 段：60 只 × 40 交易日 5m 的回读在服务端
+  `_t_recv`→`_t_reply` 花了约 11.5s 而零慢日志——时间烧在 `to_jsonable`（约 12.7MB 响应的转换）
+  和发布上。现在每个请求都分段计时（handle / to_jsonable / publish），总时长超过
+  `slow_request_seconds` 而 handler 段未超时（即盲区情形）时记一条分段 `slow response` 日志，
+  并在消息里提示可用 `chunk_size` 或收窄窗口。
+
+- **`get_trading_dates` 原生空结果会交叉核对 ContextInfo 指数日历**（#391，@2092330995 报告）。
+  盘前单日查询 SH 有数据、SZ 返回空：SDK 侧某市场日历未加载时回答空列表，而
+  `_native_or_context` 把"原生成功"原样返回，空列表被下游读成"休市"并在交易时段误拦深市任务。
+  现在原生返回空时会再走一遍 ContextInfo 代表指数日历：节假日两条路径同为空（行为不变），
+  数据未就绪时指数日历能给出正确答案。provider 上新增 `_last_trading_dates_answer`
+  （选用路径 + 行数 + 时刻）供诊断探针读取；替代路径命中时每市场每进程打印一次说明。
+
 ## [0.3.60] - 2026-09-24
 
 ### 修复

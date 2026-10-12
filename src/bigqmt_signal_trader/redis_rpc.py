@@ -1847,7 +1847,10 @@ class BigQmtRpcHandlers:
         return rows
 
     _ORDER_IDENTITY_LOCAL_LIMIT = 5000
-    _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 86400.0
+    # 7 days, matching exec_events.ORDER_IDENTITY_TTL_SECONDS: orders stay
+    # queryable across days, and a next-day re-read used to come back
+    # renamed under the bridge process (#393).
+    _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 7 * 86400.0
 
     def _remember_order_identity_local(self, account_id, remark, strategy_name):
         remark = str(remark or "").strip()
@@ -1860,7 +1863,24 @@ class BigQmtRpcHandlers:
                 # Tests (and the QMT sandbox) build handlers via __new__ and
                 # skip __init__ -- create on first use.
                 journal = self._order_identity_local = collections.OrderedDict()
-            journal[key] = (time.time(), str(strategy_name or ""))
+            name = str(strategy_name or "")
+            existing = journal.get(key)
+            if existing is not None:
+                existing_name = existing[1]
+                if existing_name and existing_name != name:
+                    # First NAMED record wins (#393): a reused remark must
+                    # not rename rows already reported -- an unconditional
+                    # overwrite flipped them to the latest same-remark
+                    # submit's name, or erased it entirely when that submit
+                    # passed "" and rows fell back to the QMT process name.
+                    if name:
+                        print("[bigqmt_rpc] order remark %r reused across "
+                              "strategies: keeping %r, ignoring %r (#393). "
+                              "Pass a unique remark per order."
+                              % (remark, existing_name, name))
+                    journal.move_to_end(key)
+                    return
+            journal[key] = (time.time(), name)
             journal.move_to_end(key)
             while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
                 journal.popitem(last=False)
@@ -2287,12 +2307,23 @@ class BigQmtRpcHandlers:
         # strDatatype, startDate, endDate)（6.9）。原来漏了 strAccountType，
         # 于是 detail_type 被塞进了账户类型的位置 —— 少一个参数、还错位，
         # 和 #96 里 get_ipo_data 把 account_id 当 type 传是同一个形状（#207）。
-        result = self._call_qmt_global(
-            "get_history_trade_detail_data", account_id,
-            self._configured_account_type(account_id),
-            detail_type, start_date, end_date
-        )
-        return result
+        #
+        # NOT _call_qmt_global (#395): that helper's "unavailable -> []" and
+        # exception-swallowing are right for the credit lookups, but here they
+        # made three different worlds indistinguishable -- function not bound,
+        # native raise, and a genuinely empty history all answered
+        # ok=True data=[]. History is a record of facts: unavailable must be
+        # an error, and a native failure must propagate.
+        func = self.qmt_api.get("get_history_trade_detail_data")
+        if func is None:
+            raise RuntimeError(
+                "get_history_trade_detail_data is not bound on this terminal "
+                "(probe_capabilities.qmt_globals shows it false). An empty "
+                "answer here would read as 'no history', which is not the "
+                "same thing (#395)")
+        raw = func(account_id, self._configured_account_type(account_id),
+                   detail_type, start_date, end_date)
+        return _normalize_grouped_detail_rows(raw)
 
     def _handle_get_assure_contract(self, params):
         return self._call_qmt_global("get_assure_contract", self._request_account_id(params))
@@ -3310,12 +3341,10 @@ class BigQmtRpcHandlers:
             settlement.result.message = ""
             return True
         if status in TERMINAL_NON_CANCEL_ORDER_STATUSES:
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel was not confirmed: order %s reached status %s"
-                % (order_sys_id, status)
-            )
-            return True
+                % (order_sys_id, status))
         if status in CANCEL_IN_FLIGHT_STATUSES:
             if not final:
                 return False
@@ -3332,12 +3361,52 @@ class BigQmtRpcHandlers:
             return True
         if not final:
             return False
-        settlement.result.success = False
-        settlement.result.message = (
+        return self._fail_cancel_settlement(
+            settlement,
             "cancel was not confirmed after %d lookup(s): order %s is still status %s"
-            % (settlement.attempts, order_sys_id, status or "unknown")
-        )
+            % (settlement.attempts, order_sys_id, status or "unknown"))
+
+    def _fail_cancel_settlement(self, settlement, message):
+        """Settle a cancel as FAILED and push a cancel_error event (#389).
+
+        QMT logs a refused cancel (已成不可撤 etc.) but fires NO callback for
+        it: a strategy that listens on on_cancel_error never learns, and
+        keeps re-cancelling a dead order. The bridge's own settle path is the
+        one place that concludes the failure (status looked up against the
+        order snapshot), so the push is synthesized here and rides the same
+        channel as native order/trade events.
+        """
+        settlement.result.success = False
+        settlement.result.message = message
+        self._publish_cancel_error(settlement, message)
         return True
+
+    def _publish_cancel_error(self, settlement, message):
+        hook = getattr(self, "exec_event_publisher", None)
+        if not callable(hook):
+            # Tests and deployments predating the strategy-side hook have no
+            # channel; the RPC reply still carries the verdict.
+            return
+        try:
+            order_ref = settlement.order_ref
+            order_sys_id = str(getattr(order_ref, "order_sys_id", "") or "")
+            remark = str(getattr(order_ref, "user_order_id", "") or "")
+            event = {
+                "event_type": "cancel_error",
+                "account_id": str(getattr(settlement, "account_id", "") or ""),
+                "stock_code": str(getattr(order_ref, "stock_code", "") or ""),
+                "order_sys_id": order_sys_id,
+                "order_id": order_sys_id,
+                "error_id": None,
+                "order_remark": remark,
+                "user_order_id": remark,
+                "error_msg": str(message or ""),
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at_ts": time.time(),
+            }
+            hook(str(getattr(settlement, "account_id", "") or ""), event)
+        except Exception:
+            pass
 
     def _apply_cancel_lookup(self, settlement, final=False):
         """Resolve an ambiguous native cancel return from the order snapshot."""
@@ -3369,12 +3438,10 @@ class BigQmtRpcHandlers:
         except Exception as exc:
             if not final:
                 return False
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel status lookup failed after %d attempt(s): %s: %s"
-                % (settlement.attempts, exc.__class__.__name__, exc)
-            )
-            return True
+                % (settlement.attempts, exc.__class__.__name__, exc))
 
         matches = [
             order for order in orders
@@ -3383,12 +3450,10 @@ class BigQmtRpcHandlers:
         if not matches:
             if not final:
                 return False
-            settlement.result.success = False
-            settlement.result.message = (
+            return self._fail_cancel_settlement(
+                settlement,
                 "cancel was not confirmed: order %s was not found after %d lookup(s)"
-                % (order_sys_id, settlement.attempts)
-            )
-            return True
+                % (order_sys_id, settlement.attempts))
 
         status = str(getattr(matches[0], "status", "") or "")
         return self._settle_cancel_from_status(
@@ -3527,6 +3592,40 @@ def _normalize_detail_rows(rows):
                 continue
             item[name] = value
         result.append(item)
+    return result
+
+
+def _jsonable_scalar(value):
+    if value is None or isinstance(value, (int, float, str, bool)):
+        return value
+    return str(value)
+
+
+def _normalize_grouped_detail_rows(rows):
+    """Serialize get_history_trade_detail_data's documented grouped answer.
+
+    The official contract is ``[(timetag, [detail, ...]), ...]`` -- the
+    example iterates ``for time, data in obj_list`` and then the details in
+    ``data``. _normalize_detail_rows alone treats each outer tuple as one
+    detail object: a tuple has no data attributes, so a fully-populated
+    history normalized to [{}], losing both the grouping and every deal in
+    it (#395). Grouped entries become ``{"timetag": t, "details": [...]}``;
+    anything not in the documented shape goes through the flat normaliser so
+    a build that answers flat rows still answers.
+    """
+    if not rows:
+        return []
+    result = []
+    for entry in rows:
+        if (isinstance(entry, (list, tuple)) and len(entry) == 2
+                and isinstance(entry[1], (list, tuple))):
+            timetag, details = entry
+            result.append({
+                "timetag": _jsonable_scalar(timetag),
+                "details": _normalize_detail_rows(details),
+            })
+        else:
+            result.extend(_normalize_detail_rows([entry]))
     return result
 
 
@@ -4395,6 +4494,7 @@ class RedisPubSubRpcService:
         waited = self._expired_before_dispatch(request, method)
         if waited is not None:
             return self._refuse_expired(request, response, method, waited, order_key)
+        _t0 = _t1 = _t_json1 = None
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
@@ -4408,6 +4508,11 @@ class RedisPubSubRpcService:
                 _t1 = time.perf_counter()
                 self._note_slow_request(method, _t1 - _t0)
             response["data"] = to_jsonable(result)
+            # to_jsonable is where a big answer burns its time (#386: 12.7MB
+            # of 5m bars took ~11s here on the serve side while the handler
+            # itself was fast, and nothing logged it -- the slow-request note
+            # covers only the handler segment).
+            _t_json1 = time.perf_counter()
             response["ok"] = True
             # Surface server-side diagnostics when the handler recorded one.
             server_error = getattr(self.handlers, "_last_server_error", None)
@@ -4436,7 +4541,7 @@ class RedisPubSubRpcService:
         response["_t_reply"] = time.time()
         if order_key is not None:
             self._remember_order_response(order_key, response, state="settled")
-        _t_pub0 = time.perf_counter() if method == "ping" else 0.0
+        _t_pub0 = time.perf_counter()
         try:
             self._publish_response(request, response)
         except Exception:
@@ -4451,6 +4556,8 @@ class RedisPubSubRpcService:
                 )
             except Exception:
                 pass
+        _t_pub1 = time.perf_counter()
+        self._note_slow_response(method, _t0, _t1, _t_json1, _t_pub0, _t_pub1)
         if method == "ping":
             # Logged AFTER publish: this print goes to the QMT output panel,
             # which costs ~1 adjust tick of GIL wait on the serving thread --
@@ -4493,6 +4600,47 @@ class RedisPubSubRpcService:
                 "slow request method=%s took %.1fs thread=%s (#342: this is "
                 "what an [adjust_phase] drain of the same size was inside)",
                 method, seconds, thread_name)
+        except Exception:
+            pass
+
+    def _note_slow_response(self, method, t_handle0, t_handle1, t_json_done,
+                            t_pub0, t_pub1):
+        """Segmented slow note for the time AROUND the handler (#386).
+
+        The handler-level note above covers only ``handlers.handle``; a big
+        answer then burns its real time in ``to_jsonable`` and the publish,
+        neither of which any log named -- a 60-code 40-day 5m read spent
+        ~11.5s server-side with zero slow lines. Fires only when the TOTAL
+        exceeds ``slow_request_seconds`` while the handler segment alone did
+        not (otherwise the handler note already named it). Never raises:
+        this runs on the adjust thread too.
+        """
+        if t_handle0 is None or t_handle1 is None:
+            return
+        try:
+            threshold = float(self.slow_request_seconds)
+        except Exception:
+            threshold = 1.0
+        if threshold <= 0:
+            return
+        handle = t_handle1 - t_handle0
+        total = t_pub1 - t_handle0
+        if total < threshold or handle >= threshold:
+            return
+        jsonable = (t_json_done - t_handle1) if t_json_done is not None else -1.0
+        publish = t_pub1 - t_pub0
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "?"
+        try:
+            from .logging_setup import get_logger
+            get_logger("rpc").warning(
+                "slow response method=%s total=%.1fs handle=%.1fs "
+                "to_jsonable=%.1fs publish=%.1fs thread=%s (#386: the slow "
+                "part is the reply conversion/send, not the handler -- "
+                "consider chunk_size or a narrower window)",
+                method, total, handle, jsonable, publish, thread_name)
         except Exception:
             pass
 
